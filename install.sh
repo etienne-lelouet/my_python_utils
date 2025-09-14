@@ -6,7 +6,7 @@ if python3 -c "import fabric" > /dev/null; then
     echo "Fabric is already installed."
 else
     echo "Installing Fabric"
-    apt install python3-fabric
+    sudo apt install python3-fabric
 fi
 
 if [ -z $1 ]; then
