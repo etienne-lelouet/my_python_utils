@@ -1,9 +1,10 @@
 import functools
 from typing import Optional
 from fabric import Connection, Config
-from invoke.exceptions import UnexpectedExit
+from paramiko import SSHConfig, Agent
 import asyncio
 import sys
+import os
 
 # TODO: Improve command logging
 # - 3 things can be printed when running commands :
@@ -12,6 +13,24 @@ import sys
 #   - The echo of the command output
 # Considerations : most of the time, we use pty=True
 
+def get_key_from_agent_by_pubkey(pubkey_path):
+    """Get the specific key from agent matching the public key file"""
+    agent = Agent()
+    agent_keys = agent.get_keys()
+    
+    # Read the public key file
+    with open(os.path.expanduser(pubkey_path), 'r') as f:
+        pubkey_data = f.read().strip()
+    
+    # Extract the key data (second field in "ssh-rsa AAAAB3... comment" format)
+    pubkey_b64 = pubkey_data.split()[1]
+    
+    # Find matching key in agent
+    for key in agent_keys:
+        if key.get_base64() == pubkey_b64:
+            return key
+    
+    return None
 
 class ConnectionWrapper:
     """
@@ -26,54 +45,38 @@ class ConnectionWrapper:
             self.name = name
 
 
-def create_local_ssh_tunnel(gateway_host: str, local_port: int = 2222, remote_host: str = 'localhost', remote_port: int = 22):
-    asyncio.create_task(run_single_command(
-        f"ssh -L {local_port}:{remote_host}:{remote_port} -N {gateway_host}", None, disown=True, asynchronous=False))
-
-
-async def try_create_tunnel(ssh_config: dict | None):
-    gateway = ssh_config.get("gateway", None)
-    if gateway is None:
-        print("Error: persistent_ssh_tunnel is True but no gateway is specified.")
-        sys.exit(1)
-
-    result = await run_single_command(
-        f"ss -tnl | tr -s ' ' | cut -d ' ' -f 4 | grep ':{ssh_config['local_port']}'", None, no_pipe=True, fail_on_returncode=False, disown=False, asynchronous=False)
-
-    if result.return_code != 0:
-        create_local_ssh_tunnel(gateway_host=gateway.get(
-            # Wait for the tunnel to be established
-            "host"), local_port=ssh_config['local_port'], remote_host=ssh_config["host"])
-        # Give some time for the tunnel to be established
-        await asyncio.sleep(1)
-
-
-async def create_connection_from_config(ssh_config: dict | None, fabric_config=None) -> ConnectionWrapper:
+def create_connection_from_config(ssh_config: dict | None, fabric_config=None) -> ConnectionWrapper:
     if ssh_config is None:
         print("Error: ssh_config is None. Cannot create connection.")
         sys.exit(1)
 
-    if ssh_config.get("host") is None:
-        print("Error: ssh_config does not contain 'host'. Cannot create connection.")
-        sys.exit(1)
-
+    user_ssh_config = SSHConfig.from_path(os.path.expanduser('~/.ssh/config'))
     host = ssh_config["host"]
+    host_config = user_ssh_config.lookup(host)
+    specific_key = None
 
-    if ssh_config.get("persistent_ssh_tunnel", False):
-        await try_create_tunnel(ssh_config)
-        host = "localhost"
+    connect_kwargs = ssh_config.get("connect_kwargs", {})
+    
+    if host_config is not None:
+        host_pubkey = host_config.get('identityfile', [None])[0]
+        if host_pubkey is not None:
+            connect_kwargs['allow_agent'] = False
+            connect_kwargs['look_for_keys'] = False
+            specific_key = get_key_from_agent_by_pubkey(host_pubkey)
+            if specific_key is not None:
+                connect_kwargs['pkey'] = specific_key
+        else:
+            specific_key = None
 
     if fabric_config is None:
         fabric_config = Config()
 
     if ssh_config.get("gateway") is not None and not ssh_config.get("persistent_ssh_tunnel", False):
         gateway = ssh_config["gateway"]
-        gateway = await create_connection_from_config(gateway)
+        gateway = create_connection_from_config(gateway)
         gateway = gateway.connection  # Get the actual Connection object from the wrapper
     else:
         gateway = None
-
-    connect_kwargs = ssh_config.get("connect_kwargs", {})
 
     if ssh_config.get("user") is None:
         c = Connection(
